@@ -1,0 +1,115 @@
+BOM COMPARISON SUMMARY
+============================================================
+Generated: 2026-01-17 18:20:28
+
+Part 1: 29540011 - i-Raman NxG 532
+Part 2: 29540031 - i-Raman NxG 785H
+
+COMPONENT COUNTS
+----------------------------------------
+Total in 29540011: 253
+Total in 29540031: 260
+Common components: 169
+Unique to 29540011: 54
+Unique to 29540031: 59
+
+STOCK STATUS (Common Components Only)
+----------------------------------------
+In Stock (Net > 0): 89
+WIP Only (Net <= 0 but WIP > 0): 0
+Shortage (Net <= 0 and WIP = 0): 80
+
+COMMON COMPONENTS WITH AVAILABLE STOCK
+----------------------------------------
+3299020040         Net:    401  Part, METAL FC DUST CAP
+3299020050         Net:    375  Part, FC MATING SLEEVE
+000001046          Net:    225  FAN GUARD 60mm METAL
+210021732          Net:    180  CLAMP
+000012262          Net:    129  WINDOW QUARTZ 41x9x0.8mm
+607510010          Net:    125  Interlock plug for i-Raman NxG
+000025234          Net:    107  FAN 60x60x10mm 5VDC
+R00000076          Net:     96  FAN GUARD 80MM
+210024778          Net:     85  Insulation Pad(000028294 make 35 pc
+000029477          Net:     83  FAN EMI FILTER II
+210023694          Net:     83  HEATSINK [MODIFY 000026327]
+000011305          Net:     80  FUSE 6.3A 250v 5x20mm 217 SERIES
+210025898          Net:     76  SLIDE GUIDE RAIL for NxG
+000030235          Net:     75  BAC102 Metrohm Probe Label
+210024751          Net:     73  HOUSING
+210025958          Net:     72  NOTCH BRACKET
+210024575          Net:     70  SENSOR PACKAGE HEATSINK
+210025065          Net:     70  OPTICAL FERRULE 7 LIVE FIBER
+210024754          Net:     68  SIDE MIRROR MOUNT
+210021743          Net:     67  RING
+210025900          Net:     66  LASER PANEL SUPPORT BRACKET for NxG
+210025899          Net:     66  SLIDE CHANNEL
+3575020120         Net:     64  667 665 USB DAQ BOARD
+000028027          Net:     61  TEC SNGL/STG 35CPL 6.0A
+3299020020         Net:     60  Part, NXG COATED TOP PANEL
+210023623          Net:     59  COVER
+210024752          Net:     57  TOP COVER
+607510040          Net:     56  Polystyrene Validation Cap
+602172100          Net:     54  Part, Interlock LED Cable
+602172140          Net:     54  Part, DC POWER ENTRY CABLE
+210025887          Net:     53  LASER MOUNTING PLATE for NxG
+210025894          Net:     53  TOP FRAME PLATE for NxG
+3575020090         Net:     53  PCB Detector Board 667N
+602172260          Net:     52  Part, NxG USB 3.0 A to B (M/M) Cable
+210025895          Net:     52  MAIN FRAME for NxG
+210022053          Net:     51  LENS MOUNT 2
+602172090          Net:     51  Part, Emission LED Cable
+210021735          Net:     51  GRATING HOLDER
+210024574          Net:     49  SENSOR PACKAGE HOUSING
+3575020070         Net:     49  Part, AUX PORT ISOLATOR
+210022050          Net:     48  PLUG
+210024753          Net:     48  BOTTOM  COVER
+602172150          Net:     48  Part, NxG SMA Cable Assembly
+210024573          Net:     47  SENSOR PACKAGE LID
+602172110          Net:     46  Part, FUSE HOLDER CABLE
+003200173          Net:     46  CABLE FFC/FPC 50POS 0.5MM 3"
+210025063          Net:     46  FERRULE MOUNT
+210022049          Net:     46  MIRROR MOUNT
+000019594          Net:     45  MAGNET 0078"D 0.197"TH 0.3PULL-LBS
+602172130          Net:     45  Part, INTERLOCK CABLE 1 (Bundle 2pcs)
+210024757          Net:     45  HEATSINK HOLDER
+602172120          Net:     45  Part, LASER KEY SWITCH CABLE
+210025947          Net:     44  BACK PANEL
+210022047          Net:     44  LONG PASS FILTER MOUNT
+602172160          Net:     44  Part, NXG FAN CABLE ASSEMBLY
+602172170          Net:     43  Part, NXG 3.5MM AUDIO JACK CABLE
+210021733          Net:     43  GRATING MOUNT
+210025948          Net:     42  BOTTOM PANEL
+210025896          Net:     41  SLIDING TRAY for NxG
+602172020          Net:     40  Part, NXG SPECTROMETER POWER CABLE
+000030332          Net:     38  FERRITE 240 OHM HINGED 10.16MM
+602172070          Net:     37  Part, USB-C PANEL MOUNT EXTENSION CABLE
+602172080          Net:     37  Part, DC Power Switch Cable
+602172040          Net:     34  Part, NxG Spectrometer Cable
+3299020010         Net:     33  Part, NXG COATED SIDE PANEL
+R00010125          Net:     33  THERMISTOR 10K OHM 1% 2WIRE MINI
+210022048          Net:     32  DICHROIC FILTER MOUNT
+360000328          Net:     31  O-ring black ID1.9 OD13mm nitrile
+3299020130         Net:     31  Part, FIBER SUPPORT PLATE
+000028778          Net:     31  AIR SLIT 50umx1000um D9.53mm
+000019699          Net:     30  MAGNET 1/8 DIAx0.1" THK
+3299020120         Net:     29  Part, SPECTROMETER MOUNTING PLATE
+210022060          Net:     28  SHUTTER
+210022056          Net:     27  APERURE MOUNT
+000029661          Net:     26  RESIN FILTER KITS 80MM (40PPI)
+210025893          Net:     22  MIDDLE FRAME PLATE
+210022394          Net:     20  DISTANCE REGULATOR 785
+210024862          Net:     20  FilterHolderTube
+200021252          Net:     19  PUSH BUTTON - BAC102
+210022057          Net:     18  FIBER HOLDER
+210024755          Net:     18  CCD HOLDER
+210024756          Net:     12  CCD HEATSINK
+607510430          Net:     10  Lab-grade probe distance regulator
+210023570          Net:      9  BASE
+3299020200         Net:      7  Part, NXG FRONT PANEL 532/785/1064
+080000664          Net:      6  Fiber Bundle Raman Probe-100u 300u
+200022220          Net:      5  NXG METAL ENCLOSURE ASSEMBLY
+210021734          Net:      1  PLATE
+000026327          Net:      1  HEAT SINK W/O FAN
+
+COMMON COMPONENTS WITH WIP ONLY
+----------------------------------------
