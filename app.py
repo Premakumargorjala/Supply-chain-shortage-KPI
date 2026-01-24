@@ -157,14 +157,13 @@ def categorize_shortages(shortages, filter_customer_id=None, exclude_mode=False)
         net_available = float(available_qoh) - float(committed_qty)
         is_manufactured = has_bom is not None
         
-        # Build order reference string
+        # Build order reference string (excluding MO numbers)
         orders = []
         if so_num:
             orders.append(f"SO:{so_num}")
         if wo_num:
             orders.append(f"WO:{wo_num}")
-        if mo_num:
-            orders.append(f"MO:{mo_num}")
+        # MO numbers removed per user request
         order_ref = ", ".join(orders) if orders else order_type
         
         # Format PO scheduled date
@@ -821,24 +820,30 @@ def get_bom_components_recursive(part_num, level=0, visited=None):
         return []
     visited.add(part_num)
     
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT bi.partId, comp.num, comp.description, bi.quantity, u.code as uom, 
-               bit.name as item_type, comp.defaultBomId
-        FROM part p
-        JOIN bom b ON p.defaultBomId = b.id
-        JOIN bomitem bi ON bi.bomId = b.id
-        JOIN part comp ON bi.partId = comp.id
-        JOIN uom u ON bi.uomId = u.id
-        JOIN bomitemtype bit ON bi.typeId = bit.id
-        WHERE p.num = %s
-        ORDER BY comp.num
-    ''', (part_num,))
-    
-    results = cursor.fetchall()
-    conn.close()
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT bi.partId, comp.num, comp.description, bi.quantity, u.code as uom, 
+                   bit.name as item_type, comp.defaultBomId
+            FROM part p
+            JOIN bom b ON p.defaultBomId = b.id
+            JOIN bomitem bi ON bi.bomId = b.id
+            JOIN part comp ON bi.partId = comp.id
+            JOIN uom u ON bi.uomId = u.id
+            JOIN bomitemtype bit ON bi.typeId = bit.id
+            WHERE p.num = %s
+            AND comp.activeFlag = 1  -- Only include active items
+            ORDER BY comp.num
+        ''', (part_num,))
+        
+        results = cursor.fetchall()
+        conn.close()
+    except Exception as e:
+        if 'conn' in locals():
+            conn.close()
+        raise Exception(f"Error fetching BOM components for {part_num}: {str(e)}")
     
     components = []
     for row in results:
@@ -865,14 +870,17 @@ def get_bom_components_recursive(part_num, level=0, visited=None):
     return components
 
 def get_inventory_with_locations(part_id):
-    """Get inventory quantities with location breakdown"""
+    """Get inventory quantities with location breakdown
+    Only counts truly available stock locations (excludes Inspection, Manufacturing, Rework, etc.)
+    """
     conn = get_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
         SELECT l.name as location, lt.name as loc_type, lg.name as loc_group,
                t.qty, t.qtyCommitted, l.countedAsAvailable,
-               CASE WHEN t.woItemId IS NOT NULL THEN 'WIP' ELSE 'Stock' END as inv_type
+               CASE WHEN t.woItemId IS NOT NULL THEN 'WIP' ELSE 'Stock' END as inv_type,
+               l.typeId as location_type_id
         FROM tag t
         JOIN location l ON t.locationId = l.id
         JOIN locationtype lt ON l.typeId = lt.id
@@ -883,9 +891,54 @@ def get_inventory_with_locations(part_id):
     locations = cursor.fetchall()
     conn.close()
     
-    available_qty = sum(row[3] for row in locations if row[5])
-    committed_qty = sum(row[4] for row in locations if row[5])
-    wip_qty = sum(row[3] for row in locations if row[6] == 'WIP' or row[1] == 'Manufacturing')
+    # Calculate quantities correctly:
+    # Available: Only count Stock/Store Front locations (excluding WIP, Inspect, Rework)
+    # Committed: Sum of ALL committed quantities from ALL locations (global allocation)
+    # WIP: Quantity in WIP locations (woItemId IS NOT NULL or Manufacturing type 80)
+    # Total: Sum of ALL quantities from ALL locations
+    
+    available_qty = 0
+    available_committed = 0  # Committed in available locations only
+    total_committed = 0  # Committed from ALL locations (global)
+    wip_qty = 0
+    
+    for row in locations:
+        loc_name = row[0].lower() if row[0] else ''
+        loc_type_id = row[7]
+        is_countable = row[5]
+        is_wip = row[6] == 'WIP'
+        qty = row[3]
+        committed = row[4]
+        
+        # Count committed from ALL locations (global allocation)
+        total_committed += committed
+        
+        # Count WIP quantity - match Fishbowl's exact definition:
+        # Only count locations with "WIP" in the name (like "Main-WIP")
+        # Fishbowl shows WIP as inventory in WIP-named locations, not all Manufacturing locations
+        # Tags tied to Work Orders (woItemId) in WIP locations are already counted via the location
+        if 'wip' in loc_name:
+            wip_qty += qty
+        
+        # Count available quantity only from truly available locations:
+        # - countedAsAvailable = 1
+        # - Location type is Stock (10) or Store Front (70)
+        # - Not WIP (woItemId IS NULL)
+        # - Not Inspection (50), Manufacturing (80), or other non-stock types
+        # - Name doesn't contain "rework", "inspect", "repair"
+        if (is_countable and 
+            not is_wip and
+            loc_type_id in (10, 70) and  # Only Stock and Store Front
+            'rework' not in loc_name and
+            'inspect' not in loc_name and
+            'repair' not in loc_name):
+            available_qty += qty  # Add qty
+            available_committed += committed  # Add committed from available locations
+    
+    # Net available = Available quantity minus committed in available locations
+    net_available_qty = available_qty - available_committed
+    
+    # Total quantity from all locations
     total_qty = sum(row[3] for row in locations)
     
     location_list = []
@@ -901,11 +954,11 @@ def get_inventory_with_locations(part_id):
         })
     
     return {
-        'available': float(available_qty),
-        'committed': float(committed_qty),
-        'net_available': float(available_qty - committed_qty),
-        'wip': float(wip_qty),
-        'total': float(total_qty),
+        'available': float(available_qty),  # Total qty in available locations (Stock/Store Front only)
+        'committed': float(total_committed),  # Total committed from ALL locations (global allocation)
+        'net_available': float(net_available_qty),  # Available - Committed in available locations (actual available)
+        'wip': float(wip_qty),  # WIP quantity (tags tied to WO or Manufacturing locations)
+        'total': float(total_qty),  # Total qty from ALL locations
         'locations': location_list
     }
 
@@ -926,8 +979,15 @@ def search_parts(query):
     conn.close()
     return [{'num': r[0], 'description': r[1] or '', 'has_bom': bool(r[2])} for r in results]
 
-def compare_boms(part_numbers):
-    """Compare BOMs of multiple parts and find common/unique components"""
+def compare_boms(part_numbers, demand_quantities=None):
+    """Compare BOMs of multiple parts and find common/unique components
+    Args:
+        part_numbers: List of part numbers to compare
+        demand_quantities: Dict mapping part_num to demand quantity (e.g., {'29540011': 10, '29540031': 5})
+    """
+    if demand_quantities is None:
+        demand_quantities = {}
+    
     all_components = {}
     part_info = {}
     
@@ -969,7 +1029,7 @@ def compare_boms(part_numbers):
         unique_nums = set(all_components[part_num].keys()) - common_nums
         unique_components[part_num] = unique_nums
     
-    # Build results with inventory data
+    # Build results with inventory data and order requirements
     common_results = []
     for comp_num in sorted(common_nums):
         # Get component info from first part
@@ -987,10 +1047,17 @@ def compare_boms(part_numbers):
         # Get quantity per each parent part
         qty_per_part = {}
         level_per_part = {}
+        total_demand = 0.0
         for pn in valid_parts:
             if comp_num in all_components[pn]:
                 qty_per_part[pn] = all_components[pn][comp_num]['quantity']
                 level_per_part[pn] = all_components[pn][comp_num]['level']
+                # Calculate total demand for this component
+                demand = float(demand_quantities.get(pn, 0))
+                total_demand += qty_per_part[pn] * demand
+        
+        # Calculate order requirement: demand - available
+        order_required = max(0, total_demand - inv['net_available'])
         
         common_results.append({
             'part_num': comp_num,
@@ -1004,13 +1071,16 @@ def compare_boms(part_numbers):
             'wip': inv['wip'],
             'total': inv['total'],
             'stock_status': stock_status,
-            'locations': inv['locations']
+            'locations': inv['locations'],
+            'total_demand': total_demand,
+            'order_required': order_required
         })
     
     # Build unique results for each part
     unique_results = {}
     for part_num in valid_parts:
         unique_results[part_num] = []
+        demand = float(demand_quantities.get(part_num, 0))
         for comp_num in sorted(unique_components[part_num]):
             comp = all_components[part_num][comp_num]
             inv = get_inventory_with_locations(comp['part_id'])
@@ -1021,6 +1091,10 @@ def compare_boms(part_numbers):
                 stock_status = 'WIP Only'
             else:
                 stock_status = 'Shortage'
+            
+            # Calculate demand and order requirement for unique components
+            component_demand = comp['quantity'] * demand
+            order_required = max(0, component_demand - inv['net_available'])
             
             unique_results[part_num].append({
                 'part_num': comp_num,
@@ -1034,7 +1108,9 @@ def compare_boms(part_numbers):
                 'wip': inv['wip'],
                 'total': inv['total'],
                 'stock_status': stock_status,
-                'locations': inv['locations']
+                'locations': inv['locations'],
+                'total_demand': component_demand,
+                'order_required': order_required
             })
     
     return {
@@ -1043,7 +1119,8 @@ def compare_boms(part_numbers):
         'common_count': len(common_nums),
         'common_components': common_results,
         'unique_components': unique_results,
-        'total_per_part': {pn: len(all_components[pn]) for pn in valid_parts}
+        'total_per_part': {pn: len(all_components[pn]) for pn in valid_parts},
+        'demand_quantities': demand_quantities
     }
 
 # HTML Template
@@ -1308,11 +1385,17 @@ HTML_TEMPLATE = '''
             text-transform: uppercase;
             font-size: 0.75rem;
             letter-spacing: 0.05em;
+            /* Keep column headers visible while scrolling */
+            position: sticky;
+            top: 0;
+            background: var(--bg-card);
+            z-index: 2;
         }
         
         td {
             padding: 0.75rem;
             border-bottom: 1px solid var(--border-color);
+            position: relative;
         }
         
         tr:hover {
@@ -1328,8 +1411,39 @@ HTML_TEMPLATE = '''
             font-family: 'JetBrains Mono', monospace;
             font-size: 0.75rem;
             color: var(--accent-purple);
+            position: relative;
+            display: inline-block;
         }
         
+        .more-link {
+            color: var(--accent-blue);
+            cursor: pointer;
+            text-decoration: underline;
+            font-weight: 500;
+        }
+        
+        .more-link:hover {
+            color: var(--accent-purple);
+        }
+        
+        .orders-dropdown {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 0.5rem;
+            margin-top: 0.25rem;
+            z-index: 1000;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--accent-purple);
+            white-space: normal;
+            max-width: 300px;
+            min-width: 200px;
+        }
         
         .badge {
             display: inline-block;
@@ -1508,8 +1622,6 @@ HTML_TEMPLATE = '''
                 </div>
             </div>
             <div style="display: flex; align-items: center; gap: 1.5rem;">
-                <!-- B&W TEK SHANGHAI Filter - Hidden for now (can be enabled later) -->
-                <!--
                 <form method="GET" action="/" style="display: flex; align-items: center; gap: 1rem; margin: 0;">
                     <div class="filter-group">
                         <label for="filter_mode">Filter B&W TEK SHANGHAI:</label>
@@ -1520,7 +1632,6 @@ HTML_TEMPLATE = '''
                         </select>
                     </div>
                 </form>
-                -->
                 <div class="timestamp">Last updated: {{ timestamp }}</div>
                 <button class="refresh-btn" onclick="location.reload()">↻ Refresh</button>
             </div>
@@ -1579,7 +1690,21 @@ HTML_TEMPLATE = '''
                                 <td>{{ part.description[:25] }}</td>
                                 <td><span class="badge red">{{ part.order_count }}</span></td>
                                 <td><span class="badge red">{{ part.total_qty_short|int }}</span></td>
-                                <td><span class="order-ref">{{ part.orders }}</span></td>
+                                <td>
+                                    <span class="order-ref">
+                                        {% if part.orders_visible %}
+                                            {{ part.orders_visible|join(', ') }}
+                                        {% else %}
+                                            -
+                                        {% endif %}
+                                        {% if part.orders_hidden %}
+                                            <span class="more-link" onclick="toggleOrders('orders-{{ loop.index0 }}')"> +{{ part.orders_hidden|length }} more</span>
+                                            <div id="orders-{{ loop.index0 }}" class="orders-dropdown" style="display: none;">
+                                                {{ part.orders_hidden|join(', ') }}
+                                            </div>
+                                        {% endif %}
+                                    </span>
+                                </td>
                                 <td>
                                     {% if part.on_order_qty > 0 %}
                                     <span class="badge green">{{ part.on_order_qty|int }}</span>
@@ -1628,7 +1753,21 @@ HTML_TEMPLATE = '''
                                 <td class="part-num">{{ part.part_num }}</td>
                                 <td>{{ part.description[:22] }}</td>
                                 <td><span class="badge orange">{{ part.order_count }}</span></td>
-                                <td><span class="order-ref">{{ part.orders }}</span></td>
+                                <td>
+                                    <span class="order-ref">
+                                        {% if part.orders_visible %}
+                                            {{ part.orders_visible|join(', ') }}
+                                        {% else %}
+                                            -
+                                        {% endif %}
+                                        {% if part.orders_hidden %}
+                                            <span class="more-link" onclick="toggleOrders('wip-orders-{{ loop.index0 }}')"> +{{ part.orders_hidden|length }} more</span>
+                                            <div id="wip-orders-{{ loop.index0 }}" class="orders-dropdown" style="display: none;">
+                                                {{ part.orders_hidden|join(', ') }}
+                                            </div>
+                                        {% endif %}
+                                    </span>
+                                </td>
                                 <td>{{ part.wip|int }}</td>
                                 <td><span class="badge orange">{{ part.being_mfg|int }}</span></td>
                             </tr>
@@ -1852,6 +1991,26 @@ HTML_TEMPLATE = '''
             }
         }
         
+        function toggleOrders(dropdownId) {
+            const dropdown = document.getElementById(dropdownId);
+            if (dropdown) {
+                if (dropdown.style.display === 'none' || dropdown.style.display === '') {
+                    dropdown.style.display = 'block';
+                } else {
+                    dropdown.style.display = 'none';
+                }
+            }
+        }
+        
+        // Close dropdowns when clicking outside
+        document.addEventListener('click', function(event) {
+            if (!event.target.closest('.order-ref')) {
+                document.querySelectorAll('.orders-dropdown').forEach(dropdown => {
+                    dropdown.style.display = 'none';
+                });
+            }
+        });
+        
         // Weekly Current Chart
         const weeklyCurrentCtx = document.getElementById('weeklyCurrentChart');
         if (weeklyCurrentCtx) {
@@ -2058,9 +2217,10 @@ def dashboard():
     # Convert sets to strings and add order count
     for part in true_by_part.values():
         refs = sorted(part['order_refs'])
+        part['all_orders'] = refs  # Store all orders
         part['orders'] = ', '.join(refs[:5]) if refs else '-'
-        if len(refs) > 5:
-            part['orders'] += f' +{len(refs)-5} more'
+        part['orders_visible'] = refs[:5]  # First 5 for display
+        part['orders_hidden'] = refs[5:] if len(refs) > 5 else []  # Remaining orders
         part['order_count'] = len(part['order_refs'])
     
     wip_by_part = {}
@@ -2081,9 +2241,10 @@ def dashboard():
     # Convert sets to strings and add order count
     for part in wip_by_part.values():
         refs = sorted(part['order_refs'])
+        part['all_orders'] = refs  # Store all orders
         part['orders'] = ', '.join(refs[:4]) if refs else '-'
-        if len(refs) > 4:
-            part['orders'] += f' +{len(refs)-4}'
+        part['orders_visible'] = refs[:4]  # First 4 for display
+        part['orders_hidden'] = refs[4:] if len(refs) > 4 else []  # Remaining orders
         part['order_count'] = len(part['order_refs'])
     
     total_count = len(shortages)
@@ -2579,10 +2740,12 @@ BOM_COMPARE_TEMPLATE = '''
                     <div class="part-input-group">
                         <label>Part 1</label>
                         <input type="text" class="part-input" name="part" placeholder="e.g., 29540011" required>
+                        <input type="number" class="part-input" name="demand" placeholder="Demand Qty" min="0" step="1" style="margin-top: 0.5rem; width: 200px;">
                     </div>
                     <div class="part-input-group">
                         <label>Part 2</label>
                         <input type="text" class="part-input" name="part" placeholder="e.g., 29540031" required>
+                        <input type="number" class="part-input" name="demand" placeholder="Demand Qty" min="0" step="1" style="margin-top: 0.5rem; width: 200px;">
                     </div>
                     <button type="button" class="btn btn-add" onclick="addPartInput()">+ Add Part</button>
                     <button type="submit" class="btn btn-primary">🔍 Compare BOMs</button>
@@ -2688,10 +2851,9 @@ BOM_COMPARE_TEMPLATE = '''
             group.className = 'part-input-group';
             group.innerHTML = `
                 <label>Part ${partCount}</label>
-                <div style="display: flex; gap: 0.5rem;">
-                    <input type="text" class="part-input" name="part" placeholder="Part number">
-                    <button type="button" class="btn btn-remove" onclick="removePartInput(this)">✕</button>
-                </div>
+                <input type="text" class="part-input" name="part" placeholder="Part number">
+                <input type="number" class="part-input" name="demand" placeholder="Demand Qty" min="0" step="1" style="margin-top: 0.5rem; width: 200px;">
+                <button type="button" class="btn btn-remove" onclick="removePartInput(this)" style="margin-top: 0.5rem;">✕</button>
             `;
             container.insertBefore(group, addBtn);
         }
@@ -2717,13 +2879,26 @@ BOM_COMPARE_TEMPLATE = '''
         document.getElementById('compareForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             
-            const inputs = document.querySelectorAll('input[name="part"]');
-            const parts = Array.from(inputs).map(i => i.value.trim()).filter(v => v);
+            const partInputs = document.querySelectorAll('input[name="part"]');
+            const demandInputs = document.querySelectorAll('input[name="demand"]');
+            const parts = Array.from(partInputs).map(i => i.value.trim()).filter(v => v);
             
             if (parts.length < 2) {
                 showError('Please enter at least 2 part numbers to compare');
                 return;
             }
+            
+            // Collect demand quantities
+            const demand_quantities = {};
+            partInputs.forEach((input, index) => {
+                const partNum = input.value.trim();
+                if (partNum && demandInputs[index]) {
+                    const demand = parseFloat(demandInputs[index].value) || 0;
+                    if (demand > 0) {
+                        demand_quantities[partNum] = demand;
+                    }
+                }
+            });
             
             document.getElementById('errorMessage').classList.remove('visible');
             document.getElementById('results').classList.remove('visible');
@@ -2733,10 +2908,25 @@ BOM_COMPARE_TEMPLATE = '''
                 const response = await fetch('/api/bom-compare', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ parts: parts })
+                    body: JSON.stringify({ parts: parts, demand_quantities: demand_quantities })
                 });
                 
-                const data = await response.json();
+                let data;
+                const contentType = response.headers.get('content-type');
+                if (contentType && contentType.includes('application/json')) {
+                    data = await response.json();
+                } else {
+                    const text = await response.text();
+                    showError('Server returned non-JSON response. Status: ' + response.status);
+                    document.getElementById('loading').classList.remove('visible');
+                    return;
+                }
+                
+                if (!response.ok) {
+                    showError(data.error || 'Server error: ' + response.status);
+                    document.getElementById('loading').classList.remove('visible');
+                    return;
+                }
                 
                 if (data.error) {
                     showError(data.error);
@@ -2848,9 +3038,9 @@ BOM_COMPARE_TEMPLATE = '''
             // Common Table Header
             let headerHtml = '<tr><th>Part Number</th><th>Description</th><th>Level</th>';
             validParts.forEach(pn => {
-                headerHtml += `<th>Qty/${pn.substring(0, 12)}</th>`;
+                headerHtml += `<th title="Quantity needed per 1 unit of ${pn}">Qty Per Unit<br><span style="font-size: 0.7em; font-weight: normal;">${pn.substring(0, 15)}</span></th>`;
             });
-            headerHtml += '<th>Available</th><th>Committed</th><th>Net</th><th>WIP</th><th>Status</th><th>Locations</th></tr>';
+            headerHtml += '<th>Available</th><th>Committed</th><th>On Hand</th><th>WIP</th><th>Status</th><th>Demand</th><th>Order Required</th><th>Locations</th></tr>';
             document.getElementById('commonTableHead').innerHTML = headerHtml;
             
             // Common Table Body
@@ -2894,12 +3084,18 @@ BOM_COMPARE_TEMPLATE = '''
                     }
                 }
                 
+                const demand = (c.total_demand || 0).toFixed(0);
+                const orderRequired = (c.order_required || 0).toFixed(0);
+                const orderRequiredClass = parseFloat(orderRequired) > 0 ? 'red' : 'green';
+                
                 bodyHtml += `
-                    <td>${c.available.toFixed(0)}</td>
-                    <td>${c.committed.toFixed(0)}</td>
                     <td>${c.net_available.toFixed(0)}</td>
+                    <td>${c.committed.toFixed(0)}</td>
+                    <td>${c.total.toFixed(0)}</td>
                     <td>${c.wip.toFixed(0)}</td>
                     <td><span class="badge ${statusClass}">${c.stock_status}</span></td>
+                    <td>${demand}</td>
+                    <td><span class="badge ${orderRequiredClass}">${orderRequired}</span></td>
                     <td title="${c.locations && c.locations.length > 0 ? c.locations.map(l => l.name + ' (' + l.qty + ')').join(', ') : ''}">
                         ${defaultLocation}
                     </td>
@@ -2928,9 +3124,11 @@ BOM_COMPARE_TEMPLATE = '''
                                         <th>Qty</th>
                                         <th>Available</th>
                                         <th>Committed</th>
-                                        <th>Net</th>
+                                        <th>On Hand</th>
                                         <th>WIP</th>
                                         <th>Status</th>
+                                        <th>Demand</th>
+                                        <th>Order Required</th>
                                         <th>Locations</th>
                                     </tr>
                                 </thead>
@@ -2964,16 +3162,22 @@ BOM_COMPARE_TEMPLATE = '''
                         }
                     }
                     
+                    const demand = (c.total_demand || 0).toFixed(0);
+                    const orderRequired = (c.order_required || 0).toFixed(0);
+                    const orderRequiredClass = parseFloat(orderRequired) > 0 ? 'red' : 'green';
+                    
                     tableHtml += `<tr>
                         <td class="part-num">${c.part_num} ${hasBomBadge}</td>
                         <td>${c.description.substring(0, 40)}</td>
                         <td>${c.level}</td>
                         <td>${c.quantity.toFixed(2)}</td>
-                        <td>${c.available.toFixed(0)}</td>
-                        <td>${c.committed.toFixed(0)}</td>
                         <td>${c.net_available.toFixed(0)}</td>
+                        <td>${c.committed.toFixed(0)}</td>
+                        <td>${c.total.toFixed(0)}</td>
                         <td>${c.wip.toFixed(0)}</td>
                         <td><span class="badge ${statusClass}">${c.stock_status}</span></td>
+                        <td>${demand}</td>
+                        <td><span class="badge ${orderRequiredClass}">${orderRequired}</span></td>
                         <td title="${c.locations && c.locations.length > 0 ? c.locations.map(l => l.name + ' (' + l.qty + ')').join(', ') : ''}">
                             ${defaultLoc}
                         </td>
@@ -3084,12 +3288,18 @@ BOM_COMPARE_TEMPLATE = '''
                     bodyHtml += `<td>${(c.qty_per_part[pn] || 0).toFixed(2)}</td>`;
                 });
                 
+                const demand = (c.total_demand || 0).toFixed(0);
+                const orderRequired = (c.order_required || 0).toFixed(0);
+                const orderRequiredClass = parseFloat(orderRequired) > 0 ? 'red' : 'green';
+                
                 bodyHtml += `
                     <td>${c.available.toFixed(0)}</td>
                     <td>${c.committed.toFixed(0)}</td>
                     <td>${c.net_available.toFixed(0)}</td>
                     <td>${c.wip.toFixed(0)}</td>
                     <td><span class="badge ${statusClass}">${c.stock_status}</span></td>
+                    <td>${demand}</td>
+                    <td><span class="badge ${orderRequiredClass}">${orderRequired}</span></td>
                     <td title="${c.locations && c.locations.length > 0 ? c.locations.map(l => l.name + ' (' + l.qty + ')').join(', ') : ''}">
                         ${defaultLocation}
                     </td>
@@ -3121,6 +3331,10 @@ BOM_COMPARE_TEMPLATE = '''
                         }
                     }
                     
+                    const demand = (c.total_demand || 0).toFixed(0);
+                    const orderRequired = (c.order_required || 0).toFixed(0);
+                    const orderRequiredClass = parseFloat(orderRequired) > 0 ? 'red' : 'green';
+                    
                     tableHtml += `<tr>
                         <td class="part-num">${c.part_num} ${hasBomBadge}</td>
                         <td>${c.description.substring(0, 40)}</td>
@@ -3131,6 +3345,8 @@ BOM_COMPARE_TEMPLATE = '''
                         <td>${c.net_available.toFixed(0)}</td>
                         <td>${c.wip.toFixed(0)}</td>
                         <td><span class="badge ${statusClass}">${c.stock_status}</span></td>
+                        <td>${demand}</td>
+                        <td><span class="badge ${orderRequiredClass}">${orderRequired}</span></td>
                         <td title="${c.locations && c.locations.length > 0 ? c.locations.map(l => l.name + ' (' + l.qty + ')').join(', ') : ''}">
                             ${defaultLoc}
                         </td>
@@ -3162,14 +3378,24 @@ def bom_compare():
 @app.route('/api/bom-compare', methods=['POST'])
 def api_bom_compare():
     """API endpoint for BOM comparison"""
-    data = request.get_json()
-    parts = data.get('parts', [])
-    
-    if len(parts) < 2:
-        return jsonify({'error': 'Need at least 2 part numbers to compare'})
-    
-    result = compare_boms(parts)
-    return jsonify(result)
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No JSON data provided'}), 400
+        
+        parts = data.get('parts', [])
+        demand_quantities = data.get('demand_quantities', {})  # Dict of part_num -> quantity
+        
+        if len(parts) < 2:
+            return jsonify({'error': 'Need at least 2 part numbers to compare'}), 400
+        
+        result = compare_boms(parts, demand_quantities)
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        traceback.print_exc()  # Print to console for debugging
+        return jsonify({'error': f'Error comparing BOMs: {error_msg}'}), 500
 
 @app.route('/api/search-parts')
 def api_search_parts():
@@ -3215,7 +3441,7 @@ def api_bom_export():
     # Common components
     writer.writerow(['COMMON COMPONENTS'])
     writer.writerow(['Part Number', 'Description', 'Has Sub-BOM', 
-                     'Level'] + [f'Qty/{pn}' for pn in result['valid_parts']] + 
+                     'Level'] + [f'Qty Per Unit ({pn})' for pn in result['valid_parts']] + 
                      ['Available Qty', 'Committed Qty', 'Net Available', 'WIP Qty', 
                       'Total Inventory', 'Stock Status', 'Default Location', 'All Locations'])
     
@@ -3494,6 +3720,11 @@ PO_DASHBOARD_TEMPLATE = '''
             text-transform: uppercase;
             font-size: 0.75rem;
             letter-spacing: 0.05em;
+            /* Keep headers visible while scrolling PO tables */
+            position: sticky;
+            top: 0;
+            background: var(--bg-card);
+            z-index: 2;
         }
         
         td {
