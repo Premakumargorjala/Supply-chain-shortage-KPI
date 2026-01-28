@@ -53,7 +53,7 @@ def get_current_shortages():
         (SELECT COALESCE(SUM(t.qty), 0) FROM tag t 
          JOIN location l ON t.locationId = l.id 
          WHERE t.partId = p.id AND t.qty > 0 
-         AND (l.typeId = 80 OR t.woItemId IS NOT NULL)) as wip_qty,
+         AND LOWER(l.name) LIKE '%wip%') as wip_qty,
         (SELECT COALESCE(SUM(poi.qtyToFulfill - poi.qtyFulfilled), 0) 
          FROM poitem poi 
          JOIN po ON poi.poId = po.id 
@@ -89,6 +89,24 @@ def get_current_shortages():
          JOIN po ON poi.poId = po.id 
          WHERE poi.partId = p.id 
          AND po.statusId IN (20, 30, 40)) as po_date_scheduled,
+        -- Check if there's ANY open MO for this part (as finished good)
+        (SELECT COUNT(DISTINCT mo.id)
+         FROM mo
+         JOIN moitem mofg ON mofg.moId = mo.id
+         WHERE mofg.partId = p.id
+         AND mofg.typeId = 10  -- Finished good
+         AND mo.statusId IN (10, 20, 50)  -- Open MO statuses
+         AND mofg.statusId NOT IN (50, 60, 70)  -- Not completed
+        ) as has_open_mo,
+        -- Check if this part is listed as a raw material (ADD) in any open MO
+        (SELECT COUNT(DISTINCT mo.id)
+         FROM mo
+         JOIN moitem mi ON mi.moId = mo.id
+         WHERE mi.partId = p.id
+         AND mi.typeId = 20  -- Raw material (ADD)
+         AND mo.statusId IN (10, 20, 50)  -- Open MO statuses
+         AND mi.statusId NOT IN (50, 60, 70)  -- Not completed
+        ) as is_raw_material_in_mo,
         -- Check if there's an open MO for this part (as finished good) with raw material shortages
         (SELECT COUNT(DISTINCT mo.id)
          FROM mo
@@ -152,10 +170,14 @@ def categorize_shortages(shortages, filter_customer_id=None, exclude_mode=False)
     other_shortages = []
     
     for row in shortages:
-        pickitem_id, qty_short, part_id, part_num, desc, has_bom, pick_id, order_type, available_qoh, committed_qty, wip_qty, on_order, being_mfg_qty, so_num, so_customer_id, so_customer_name, wo_num, mo_num, po_nums, po_date_scheduled, mo_with_rm_shortage = row
+        pickitem_id, qty_short, part_id, part_num, desc, has_bom, pick_id, order_type, available_qoh, committed_qty, wip_qty, on_order, being_mfg_qty, so_num, so_customer_id, so_customer_name, wo_num, mo_num, po_nums, po_date_scheduled, has_open_mo, is_raw_material_in_mo, mo_with_rm_shortage = row
         total_wip = float(wip_qty) + float(being_mfg_qty)
         net_available = float(available_qoh) - float(committed_qty)
-        is_manufactured = has_bom is not None
+        # A part is manufactured if it has a BOM (defaultBomId is not NULL and > 0)
+        is_manufactured = has_bom is not None and int(has_bom or 0) > 0
+        has_open_mo_count = int(has_open_mo or 0)
+        is_raw_material_in_mo_count = int(is_raw_material_in_mo or 0)
+        mo_with_rm_shortage_count = int(mo_with_rm_shortage or 0)
         
         # Build order reference string (excluding MO numbers)
         orders = []
@@ -197,24 +219,37 @@ def categorize_shortages(shortages, filter_customer_id=None, exclude_mode=False)
             'being_mfg_qty': float(being_mfg_qty),
             'on_order_qty': float(on_order),
             'is_manufactured': is_manufactured,
-            'mo_with_rm_shortage': int(mo_with_rm_shortage or 0)
+            'has_open_mo': has_open_mo_count,
+            'is_raw_material_in_mo': is_raw_material_in_mo_count,
+            'mo_with_rm_shortage': mo_with_rm_shortage_count
         }
         
-        # Categorize based on net available (available - committed) and WIP
-        # Special handling for manufactured parts (with BOM):
-        # - Only count as supply chain shortage if there's an open MO with raw material shortages
-        # - Purchased parts (no BOM) are always supply chain shortages if net_available <= 0
+        # Categorize based on Fishbowl's logic:
+        # - "ADD" in MO = TRUE Material Shortage (part is raw material, needs to be purchased/added)
+        # - "Create" in MO = WIP Shortage (part is finished good, needs MO to be created)
+        # - Purchased parts (no BOM) with no stock = TRUE Material Shortage
         
+        # Check if part is listed as raw material (ADD) in any open MO
+        is_add_in_mo = is_raw_material_in_mo_count > 0
+        
+        # Determine if it's a supply chain shortage (TRUE Material Shortage)
         is_supply_chain_shortage = False
-        if is_manufactured:
+        if is_add_in_mo:
+            # Part is listed as raw material (ADD) in an open MO → TRUE shortage
+            is_supply_chain_shortage = True
+        elif is_manufactured:
             # Manufactured part: Only a supply chain shortage if MO exists with raw material shortages
-            is_supply_chain_shortage = (mo_with_rm_shortage or 0) > 0
+            is_supply_chain_shortage = mo_with_rm_shortage_count > 0
         else:
             # Purchased part: Supply chain shortage if no net available stock
             is_supply_chain_shortage = net_available <= 0
         
-        if is_supply_chain_shortage and total_wip <= 0:
-            # TRUE shortage: Supply chain shortage and no WIP
+        # Apply categorization
+        if is_supply_chain_shortage:
+            # TRUE shortage: Supply chain shortage (needs materials to be purchased/added)
+            # - Part is raw material (ADD) in open MO
+            # - Purchased part with no stock
+            # - Manufactured part with MO that has raw material shortages
             # Apply customer filter if specified
             if filter_customer_id is None:
                 # No filter - include all
@@ -227,27 +262,18 @@ def categorize_shortages(shortages, filter_customer_id=None, exclude_mode=False)
                 # Include mode - include only this customer
                 if item['so_customer_id'] == filter_customer_id:
                     true_shortages.append(item)
-        elif net_available <= 0 and total_wip > 0:
-            # WIP shortage: No net available stock but being manufactured
-            # For manufactured parts, only count as WIP if there's an MO with raw material shortages
-            if is_manufactured:
-                if (mo_with_rm_shortage or 0) > 0:
-                    wip_shortages.append(item)
-                else:
-                    # Manufactured part with WIP but no raw material shortages - manufacturing issue, not supply chain
-                    other_shortages.append(item)
-            else:
-                # Purchased part being manufactured - WIP shortage
-                wip_shortages.append(item)
+        elif is_manufactured:
+            # WIP Shortage: Manufactured part that needs MO to be created or is waiting for manufacturing
+            # Conditions for WIP shortage:
+            # 1. Part is manufactured (has BOM)
+            # 2. Part is NOT listed as raw material (ADD) in any open MO
+            # 3. If it has an open MO, that MO does NOT have raw material shortages
+            # 4. Needs MO to be created (has_open_mo_count == 0) OR MO is waiting for manufacturing
+            wip_shortages.append(item)
         else:
-            # Should not happen - stock available and not committed, but still showing as shortage
-            # For manufactured parts without MO/raw material shortages, this is a manufacturing issue
-            if is_manufactured and (mo_with_rm_shortage or 0) == 0:
-                # Manufactured part, no MO with raw material shortages - manufacturing issue, not supply chain
-                other_shortages.append(item)
-            else:
-                # Data issue, location problem, or priority/sequencing issue
-                other_shortages.append(item)
+            # Purchased part (no BOM) that is NOT a supply chain shortage
+            # This means net_available > 0, so it's a location/commitment/sequencing issue
+            other_shortages.append(item)
     
     return true_shortages, wip_shortages, other_shortages
 
@@ -373,6 +399,61 @@ def get_monthly_kpi():
     
     return [{'month': r[2], 'short_items': r[3], 'unique_parts': r[4], 'affected_picks': r[5]} for r in results]
 
+def get_daily_kpi():
+    """Get daily shortage KPIs - shows currently open shortages from picks created each day"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    query = '''
+    SELECT 
+        DATE(pk.dateCreated) as day_date,
+        COUNT(DISTINCT pi.id) as short_pick_items,
+        COUNT(DISTINCT pi.partId) as unique_parts_short,
+        COUNT(DISTINCT pk.id) as picks_with_shorts
+    FROM pickitem pi
+    JOIN pick pk ON pi.pickId = pk.id
+    WHERE pi.statusId = 5
+    AND pk.dateCreated >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+    GROUP BY DATE(pk.dateCreated)
+    ORDER BY day_date DESC
+    '''
+    
+    cursor.execute(query)
+    results = cursor.fetchall()
+    conn.close()
+    
+    return [{'day_date': str(r[0]), 'short_items': r[1], 'unique_parts': r[2], 'affected_picks': r[3]} for r in results]
+
+def get_daily_kpi_historical():
+    """Get historical daily shortage KPIs using audit tables - shows all shortages that existed during each day
+    
+    This includes both resolved and currently open shortages, giving a true historical snapshot.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Find all pickitems that had statusId=5 (shortage) during each day
+    # We use the revision timestamp to determine when the shortage occurred
+    query = '''
+    SELECT 
+        DATE(r.timestamp) as day_date,
+        COUNT(DISTINCT pia.id) as short_pick_items,
+        COUNT(DISTINCT pia.partId) as unique_parts_short,
+        COUNT(DISTINCT pia.pickId) as picks_with_shorts
+    FROM pickitem_aud pia
+    JOIN revinfo r ON pia.REV = r.id
+    WHERE pia.statusId = 5
+    AND r.timestamp >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+    GROUP BY DATE(r.timestamp)
+    ORDER BY day_date DESC
+    '''
+    
+    cursor.execute(query)
+    results = cursor.fetchall()
+    conn.close()
+    
+    return [{'day_date': str(r[0]), 'short_items': r[1], 'unique_parts': r[2], 'affected_picks': r[3]} for r in results]
+
 def get_aging():
     """Get aging analysis"""
     conn = get_connection()
@@ -495,27 +576,100 @@ def get_po_aging():
     
     return [{'bucket': r[0], 'po_count': r[1], 'total_value': float(r[2] or 0)} for r in results]
 
-def get_vendor_performance():
-    """Get vendor performance metrics"""
+def get_vendor_performance(start_date=None, end_date=None):
+    """Get vendor performance metrics with date filtering
+    
+    Args:
+        start_date: Start date for filtering (YYYY-MM-DD format)
+        end_date: End date for filtering (YYYY-MM-DD format)
+    """
     conn = get_connection()
     cursor = conn.cursor()
     
-    query = '''
+    # Build date filter conditions
+    date_filter = ""
+    if start_date:
+        date_filter += f" AND po.dateIssued >= '{start_date}'"
+    if end_date:
+        date_filter += f" AND po.dateIssued <= '{end_date}'"
+    
+    query = f'''
     SELECT 
         v.id,
         v.name as vendor_name,
         COUNT(DISTINCT po.id) as total_pos,
         SUM((SELECT SUM(poi.totalCost) FROM poitem poi WHERE poi.poId = po.id)) as total_value,
         AVG(DATEDIFF(po.dateCompleted, po.dateIssued)) as avg_fulfillment_days,
-        COUNT(DISTINCT CASE WHEN po.dateCompleted IS NOT NULL THEN po.id END) as completed_pos
+        COUNT(DISTINCT CASE WHEN po.dateCompleted IS NOT NULL THEN po.id END) as completed_pos,
+        -- On-time delivery: POs completed on or before scheduled date
+        COUNT(DISTINCT CASE 
+            WHEN po.dateCompleted IS NOT NULL 
+            AND po.dateCompleted <= COALESCE(
+                (SELECT MAX(poi.dateScheduledFulfillment) 
+                 FROM poitem poi 
+                 WHERE poi.poId = po.id), 
+                po.dateIssued
+            )
+            THEN po.id 
+        END) as on_time_pos,
+        -- Late deliveries
+        COUNT(DISTINCT CASE 
+            WHEN po.dateCompleted IS NOT NULL 
+            AND po.dateCompleted > COALESCE(
+                (SELECT MAX(poi.dateScheduledFulfillment) 
+                 FROM poitem poi 
+                 WHERE poi.poId = po.id), 
+                po.dateIssued
+            )
+            THEN po.id 
+        END) as late_pos,
+        -- Average days late (for late deliveries)
+        AVG(CASE 
+            WHEN po.dateCompleted IS NOT NULL 
+            AND po.dateCompleted > COALESCE(
+                (SELECT MAX(poi.dateScheduledFulfillment) 
+                 FROM poitem poi 
+                 WHERE poi.poId = po.id), 
+                po.dateIssued
+            )
+            THEN DATEDIFF(po.dateCompleted, COALESCE(
+                (SELECT MAX(poi.dateScheduledFulfillment) 
+                 FROM poitem poi 
+                 WHERE poi.poId = po.id), 
+                po.dateIssued
+            ))
+            ELSE NULL
+        END) as avg_days_late,
+        -- Fulfillment rate (completed vs total)
+        CASE 
+            WHEN COUNT(DISTINCT po.id) > 0 
+            THEN (COUNT(DISTINCT CASE WHEN po.dateCompleted IS NOT NULL THEN po.id END) * 100.0 / COUNT(DISTINCT po.id))
+            ELSE 0
+        END as fulfillment_rate,
+        -- On-time delivery rate
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN po.dateCompleted IS NOT NULL THEN po.id END) > 0
+            THEN (COUNT(DISTINCT CASE 
+                WHEN po.dateCompleted IS NOT NULL 
+                AND po.dateCompleted <= COALESCE(
+                    (SELECT MAX(poi.dateScheduledFulfillment) 
+                     FROM poitem poi 
+                     WHERE poi.poId = po.id), 
+                    po.dateIssued
+                )
+                THEN po.id 
+            END) * 100.0 / COUNT(DISTINCT CASE WHEN po.dateCompleted IS NOT NULL THEN po.id END))
+            ELSE 0
+        END as on_time_rate
     FROM po
     JOIN vendor v ON po.vendorId = v.id
     WHERE po.statusId IN (20, 30, 40, 60)  -- Include completed
     AND po.dateIssued IS NOT NULL
+    {date_filter}
     GROUP BY v.id, v.name
     HAVING total_pos > 0
     ORDER BY total_value DESC
-    LIMIT 20
+    LIMIT 50
     '''
     
     cursor.execute(query)
@@ -528,7 +682,12 @@ def get_vendor_performance():
         'total_pos': r[2],
         'total_value': float(r[3] or 0),
         'avg_fulfillment_days': float(r[4] or 0) if r[4] else None,
-        'completed_pos': r[5]
+        'completed_pos': r[5],
+        'on_time_pos': r[6],
+        'late_pos': r[7],
+        'avg_days_late': float(r[8] or 0) if r[8] else None,
+        'fulfillment_rate': float(r[9] or 0),
+        'on_time_rate': float(r[10] or 0)
     } for r in results]
 
 def get_overdue_pos():
@@ -1279,7 +1438,7 @@ HTML_TEMPLATE = '''
         
         .kpi-grid {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns: repeat(5, 1fr);
             gap: 1.5rem;
             margin-bottom: 2rem;
         }
@@ -1459,7 +1618,7 @@ HTML_TEMPLATE = '''
         
         .trend-grid {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(2, 1fr);
             gap: 1.5rem;
         }
         
@@ -1653,6 +1812,11 @@ HTML_TEMPLATE = '''
                 <div class="kpi-label">Total Short Items</div>
                 <div class="kpi-value">{{ total_count }}</div>
                 <div class="kpi-subtext">{{ true_pct }}% true shortage rate</div>
+            </div>
+            <div class="kpi-card blue">
+                <div class="kpi-label">Total Qty Short</div>
+                <div class="kpi-value">{{ total_qty_short|int }}</div>
+                <div class="kpi-subtext">Total pieces short - TRUE Material Shortages only</div>
             </div>
             <div class="kpi-card yellow">
                 <div class="kpi-label">Other Issues</div>
@@ -1920,6 +2084,75 @@ HTML_TEMPLATE = '''
             
             <div class="section">
                 <div class="section-title">
+                    <span class="icon green">📈</span>
+                    Daily Trend
+                </div>
+                <div class="tab-container" style="margin-top: 1rem;">
+                    <div class="tab-header">
+                        <button class="tab-btn active" onclick="showDailyTab('current')">
+                            Currently Open
+                        </button>
+                        <button class="tab-btn" onclick="showDailyTab('historical')">
+                            Historical Total
+                        </button>
+                    </div>
+                    <div class="tab-content active" id="daily-current">
+                        <div style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
+                            Currently open shortages from picks created each day
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="dailyCurrentChart"></canvas>
+                        </div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Date</th>
+                                    <th>Items</th>
+                                    <th>Parts</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for day in daily %}
+                                <tr>
+                                    <td>{{ day.day_date }}</td>
+                                    <td>{{ day.short_items }}</td>
+                                    <td>{{ day.unique_parts }}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="tab-content" id="daily-historical">
+                        <div style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
+                            All shortages that existed during each day (includes resolved ones) - from audit tables
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="dailyHistoricalChart"></canvas>
+                        </div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Date</th>
+                                    <th>Items</th>
+                                    <th>Parts</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for day in daily_historical %}
+                                <tr>
+                                    <td>{{ day.day_date }}</td>
+                                    <td>{{ day.short_items }}</td>
+                                    <td>{{ day.unique_parts }}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="section">
+                <div class="section-title">
                     <span class="icon red">⏱</span>
                     Aging Analysis
                 </div>
@@ -2166,6 +2399,104 @@ HTML_TEMPLATE = '''
                 }
             });
         }
+        
+        function showDailyTab(tabId) {
+            const tabContainer = document.querySelector('#daily-current')?.closest('.tab-container');
+            if (tabContainer) {
+                tabContainer.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+                tabContainer.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+                
+                const btn = tabContainer.querySelector(`[onclick="showDailyTab('${tabId}')"]`);
+                const content = document.getElementById(`daily-${tabId}`);
+                if (btn) btn.classList.add('active');
+                if (content) content.classList.add('active');
+                
+                // Redraw chart when tab changes
+                if (tabId === 'current' && window.dailyCurrentChart) {
+                    window.dailyCurrentChart.update();
+                } else if (tabId === 'historical' && window.dailyHistoricalChart) {
+                    window.dailyHistoricalChart.update();
+                }
+            }
+        }
+        
+        // Daily Current Chart
+        const dailyCurrentCtx = document.getElementById('dailyCurrentChart');
+        if (dailyCurrentCtx) {
+            const dailyCurrentData = {
+                labels: [{% for day in daily %}'{{ day.day_date }}'{% if not loop.last %},{% endif %}{% endfor %}],
+                datasets: [{
+                    label: 'Shortage Items',
+                    data: [{% for day in daily %}{{ day.short_items }}{% if not loop.last %},{% endif %}{% endfor %}],
+                    borderColor: 'rgb(34, 197, 94)',
+                    backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                    tension: 0.4,
+                    fill: true
+                }, {
+                    label: 'Unique Parts',
+                    data: [{% for day in daily %}{{ day.unique_parts }}{% if not loop.last %},{% endif %}{% endfor %}],
+                    borderColor: 'rgb(139, 92, 246)',
+                    backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                    tension: 0.4,
+                    fill: true
+                }]
+            };
+            window.dailyCurrentChart = new Chart(dailyCurrentCtx, {
+                type: 'line',
+                data: dailyCurrentData,
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: true, position: 'top' },
+                        title: { display: false }
+                    },
+                    scales: {
+                        y: { beginAtZero: true, grid: { color: 'rgba(45, 55, 72, 0.3)' } },
+                        x: { grid: { color: 'rgba(45, 55, 72, 0.3)' } }
+                    }
+                }
+            });
+        }
+        
+        // Daily Historical Chart
+        const dailyHistoricalCtx = document.getElementById('dailyHistoricalChart');
+        if (dailyHistoricalCtx) {
+            const dailyHistoricalData = {
+                labels: [{% for day in daily_historical %}'{{ day.day_date }}'{% if not loop.last %},{% endif %}{% endfor %}],
+                datasets: [{
+                    label: 'Shortage Items',
+                    data: [{% for day in daily_historical %}{{ day.short_items }}{% if not loop.last %},{% endif %}{% endfor %}],
+                    borderColor: 'rgb(239, 68, 68)',
+                    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                    tension: 0.4,
+                    fill: true
+                }, {
+                    label: 'Unique Parts',
+                    data: [{% for day in daily_historical %}{{ day.unique_parts }}{% if not loop.last %},{% endif %}{% endfor %}],
+                    borderColor: 'rgb(249, 115, 22)',
+                    backgroundColor: 'rgba(249, 115, 22, 0.1)',
+                    tension: 0.4,
+                    fill: true
+                }]
+            };
+            window.dailyHistoricalChart = new Chart(dailyHistoricalCtx, {
+                type: 'line',
+                data: dailyHistoricalData,
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: true, position: 'top' },
+                        title: { display: false }
+                    },
+                    scales: {
+                        y: { beginAtZero: true, grid: { color: 'rgba(45, 55, 72, 0.3)' } },
+                        x: { grid: { color: 'rgba(45, 55, 72, 0.3)' } }
+                    }
+                }
+            });
+        }
     </script>
 </body>
 </html>
@@ -2185,6 +2516,8 @@ def dashboard():
     weekly_historical = get_weekly_kpi_historical()
     monthly = get_monthly_kpi()
     monthly_historical = get_monthly_kpi_historical()
+    daily = get_daily_kpi()
+    daily_historical = get_daily_kpi_historical()
     aging = get_aging()
     
     # Aggregate by part, collecting all order references
@@ -2250,6 +2583,9 @@ def dashboard():
     total_count = len(shortages)
     true_pct = round(len(true_shortages) / total_count * 100, 1) if total_count > 0 else 0
     
+    # Calculate total quantity short for TRUE Material Shortages only
+    total_qty_short = sum(s['qty_short'] for s in true_shortages)
+    
     return render_template_string(HTML_TEMPLATE,
         timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         filter_mode=filter_mode,
@@ -2257,6 +2593,7 @@ def dashboard():
         wip_count=len(wip_shortages),
         other_count=len(other_shortages),
         total_count=total_count,
+        total_qty_short=total_qty_short,
         true_parts=len(true_by_part),
         wip_parts=len(wip_by_part),
         other_parts=len(set(s['part_id'] for s in other_shortages)),
@@ -2267,6 +2604,8 @@ def dashboard():
         weekly_historical=weekly_historical[:8],
         monthly=monthly[:6],
         monthly_historical=monthly_historical[:6],
+        daily=daily[:30],
+        daily_historical=daily_historical[:30],
         aging=aging
     )
 
@@ -2512,6 +2851,7 @@ BOM_COMPARE_TEMPLATE = '''
         .kpi-card.green::before { background: var(--accent-green); }
         .kpi-card.purple::before { background: var(--accent-purple); }
         .kpi-card.cyan::before { background: var(--accent-cyan); }
+        .kpi-card.orange::before { background: var(--accent-orange); }
         
         .kpi-label {
             font-size: 0.875rem;
@@ -2529,6 +2869,13 @@ BOM_COMPARE_TEMPLATE = '''
         .kpi-card.green .kpi-value { color: var(--accent-green); }
         .kpi-card.purple .kpi-value { color: var(--accent-purple); }
         .kpi-card.cyan .kpi-value { color: var(--accent-cyan); }
+        .kpi-card.orange .kpi-value { color: var(--accent-orange); }
+        
+        .kpi-subtext {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 0.25rem;
+        }
         
         /* Tabs */
         .tab-container {
@@ -2841,6 +3188,8 @@ BOM_COMPARE_TEMPLATE = '''
         let currentParts = [];
         let filteredCommonData = [];
         let filteredUniqueData = {};
+        let totalDemandCommon = 0;
+        let totalDemandUnique = {};
         
         function addPartInput() {
             partCount++;
@@ -2868,12 +3217,71 @@ BOM_COMPARE_TEMPLATE = '''
             partCount = groups.length;
         }
         
+        function updateKPICards(tabId) {
+            if (!currentData) return;
+            
+            const validParts = currentData.valid_parts;
+            
+            // Use filtered data if available, otherwise use original data
+            const commonData = filteredCommonData.length > 0 ? filteredCommonData : currentData.common_components;
+            const inStock = commonData.filter(c => c.stock_status === 'In Stock').length;
+            const shortage = commonData.filter(c => c.stock_status === 'Shortage').length;
+            const subAsm = commonData.filter(c => c.has_bom).length;
+            
+            let totalDemand = 0;
+            let demandLabel = 'Total Demand';
+            
+            if (tabId === 'common') {
+                // Calculate total demand from filtered/common components
+                totalDemand = commonData.reduce((sum, c) => sum + (c.total_demand || 0), 0);
+                demandLabel = 'Total Demand (Common)';
+            } else if (tabId.startsWith('unique-')) {
+                // Extract part number from tabId (e.g., 'unique-29540011' -> '29540011')
+                const partNum = validParts.find(p => 'unique-' + p.replace(/[^a-zA-Z0-9]/g, '_') === tabId);
+                if (partNum) {
+                    // Use filtered unique data if available, otherwise use original
+                    const uniqueData = (filteredUniqueData[partNum] && filteredUniqueData[partNum].length > 0) 
+                        ? filteredUniqueData[partNum] 
+                        : currentData.unique_components[partNum];
+                    totalDemand = uniqueData.reduce((sum, c) => sum + (c.total_demand || 0), 0);
+                    demandLabel = `Total Demand (${partNum})`;
+                }
+            }
+            
+            document.getElementById('kpiGrid').innerHTML = `
+                <div class="kpi-card blue">
+                    <div class="kpi-label">Common Components</div>
+                    <div class="kpi-value">${commonData.length}</div>
+                </div>
+                <div class="kpi-card green">
+                    <div class="kpi-label">In Stock</div>
+                    <div class="kpi-value">${inStock}</div>
+                </div>
+                <div class="kpi-card purple">
+                    <div class="kpi-label">Sub-Assemblies</div>
+                    <div class="kpi-value">${subAsm}</div>
+                </div>
+                <div class="kpi-card cyan">
+                    <div class="kpi-label">Shortages</div>
+                    <div class="kpi-value">${shortage}</div>
+                </div>
+                <div class="kpi-card orange">
+                    <div class="kpi-label">${demandLabel}</div>
+                    <div class="kpi-value">${totalDemand.toFixed(0)}</div>
+                    <div class="kpi-subtext">Total pieces required</div>
+                </div>
+            `;
+        }
+        
         function showTab(tabId) {
             document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
             
             document.querySelector(`[onclick="showTab('${tabId}')"]`).classList.add('active');
             document.getElementById(`tab-${tabId}`).classList.add('active');
+            
+            // Update KPI cards based on active tab
+            updateKPICards(tabId);
         }
         
         document.getElementById('compareForm').addEventListener('submit', async function(e) {
@@ -3002,29 +3410,21 @@ BOM_COMPARE_TEMPLATE = '''
             }).join('');
             document.getElementById('partInfoGrid').innerHTML = partInfoHtml;
             
+            // Calculate total demand for common components
+            totalDemandCommon = data.common_components.reduce((sum, c) => sum + (c.total_demand || 0), 0);
+            
+            // Calculate total demand for unique components per part
+            totalDemandUnique = {};
+            validParts.forEach(pn => {
+                totalDemandUnique[pn] = data.unique_components[pn].reduce((sum, c) => sum + (c.total_demand || 0), 0);
+            });
+            
             // KPI Cards
             const inStock = data.common_components.filter(c => c.stock_status === 'In Stock').length;
             const shortage = data.common_components.filter(c => c.stock_status === 'Shortage').length;
             const subAsm = data.common_components.filter(c => c.has_bom).length;
             
-            document.getElementById('kpiGrid').innerHTML = `
-                <div class="kpi-card blue">
-                    <div class="kpi-label">Common Components</div>
-                    <div class="kpi-value">${data.common_count}</div>
-                </div>
-                <div class="kpi-card green">
-                    <div class="kpi-label">In Stock</div>
-                    <div class="kpi-value">${inStock}</div>
-                </div>
-                <div class="kpi-card purple">
-                    <div class="kpi-label">Sub-Assemblies</div>
-                    <div class="kpi-value">${subAsm}</div>
-                </div>
-                <div class="kpi-card cyan">
-                    <div class="kpi-label">Shortages</div>
-                    <div class="kpi-value">${shortage}</div>
-                </div>
-            `;
+            updateKPICards('common');
             
             // Tab Header - add unique tabs
             let tabHtml = `<button class="tab-btn active" onclick="showTab('common')">Common (${data.common_count})</button>`;
@@ -3241,6 +3641,13 @@ BOM_COMPARE_TEMPLATE = '''
             
             // Re-render tables with filtered data
             renderFilteredTables();
+            
+            // Update KPI cards based on active tab
+            const activeTab = document.querySelector('.tab-btn.active');
+            if (activeTab) {
+                const tabId = activeTab.getAttribute('onclick').match(/'([^']+)'/)[1];
+                updateKPICards(tabId);
+            }
         }
         
         function clearFilters() {
@@ -3257,6 +3664,13 @@ BOM_COMPARE_TEMPLATE = '''
             }
             
             renderFilteredTables();
+            
+            // Update KPI cards based on active tab
+            const activeTab = document.querySelector('.tab-btn.active');
+            if (activeTab) {
+                const tabId = activeTab.getAttribute('onclick').match(/'([^']+)'/)[1];
+                updateKPICards(tabId);
+            }
         }
         
         function renderFilteredTables() {
@@ -3948,10 +4362,40 @@ PO_DASHBOARD_TEMPLATE = '''
             </div>
         </div>
         
-        <!-- Vendor Performance -->
+        <!-- Vendor Scorecard -->
         <div class="section">
-            <div class="section-title">
-                <span>🏆</span> Top Vendors by Value
+            <div class="section-title" style="justify-content: space-between; align-items: center;">
+                <div style="display: flex; align-items: center; gap: 0.5rem;">
+                    <span>🏆</span> Vendor Scorecard
+                </div>
+                <div style="display: flex; gap: 1rem; align-items: center;">
+                    <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; color: var(--text-secondary);">
+                        From:
+                        <input type="date" id="startDate" value="{{ request.args.get('start_date', '') }}" 
+                               style="background: var(--bg-secondary); border: 1px solid var(--border-color); 
+                                      color: var(--text-primary); padding: 0.5rem; border-radius: 6px; 
+                                      font-family: inherit;">
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; color: var(--text-secondary);">
+                        To:
+                        <input type="date" id="endDate" value="{{ request.args.get('end_date', '') }}" 
+                               style="background: var(--bg-secondary); border: 1px solid var(--border-color); 
+                                      color: var(--text-primary); padding: 0.5rem; border-radius: 6px; 
+                                      font-family: inherit;">
+                    </label>
+                    <button onclick="applyDateFilter()" 
+                            style="background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple)); 
+                                   color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; 
+                                   cursor: pointer; font-family: inherit; font-weight: 600;">
+                        Apply Filter
+                    </button>
+                    <button onclick="clearDateFilter()" 
+                            style="background: var(--bg-secondary); color: var(--text-primary); 
+                                   border: 1px solid var(--border-color); padding: 0.5rem 1rem; 
+                                   border-radius: 6px; cursor: pointer; font-family: inherit;">
+                        Clear
+                    </button>
+                </div>
             </div>
             <div class="scroll-table">
                 <table>
@@ -3960,18 +4404,38 @@ PO_DASHBOARD_TEMPLATE = '''
                             <th>Vendor</th>
                             <th>Total POs</th>
                             <th>Total Value</th>
-                            <th>Completed POs</th>
-                            <th>Avg Fulfillment Days</th>
+                            <th>Completed</th>
+                            <th>On-Time</th>
+                            <th>Late</th>
+                            <th>On-Time Rate</th>
+                            <th>Fulfillment Rate</th>
+                            <th>Avg Days</th>
+                            <th>Avg Days Late</th>
                         </tr>
                     </thead>
                     <tbody>
                         {% for vendor in vendor_performance %}
                         <tr>
-                            <td>{{ vendor.vendor_name }}</td>
+                            <td><strong>{{ vendor.vendor_name }}</strong></td>
                             <td>{{ vendor.total_pos }}</td>
                             <td>${{ "%.2f"|format(vendor.total_value) }}</td>
                             <td>{{ vendor.completed_pos }}</td>
+                            <td style="color: var(--accent-green);">{{ vendor.on_time_pos }}</td>
+                            <td style="color: var(--accent-red);">{{ vendor.late_pos }}</td>
+                            <td>
+                                <span style="color: {% if vendor.on_time_rate >= 90 %}var(--accent-green){% elif vendor.on_time_rate >= 70 %}var(--accent-yellow){% else %}var(--accent-red){% endif %};">
+                                    {{ "%.1f"|format(vendor.on_time_rate) }}%
+                                </span>
+                            </td>
+                            <td>
+                                <span style="color: {% if vendor.fulfillment_rate >= 90 %}var(--accent-green){% elif vendor.fulfillment_rate >= 70 %}var(--accent-yellow){% else %}var(--accent-red){% endif %};">
+                                    {{ "%.1f"|format(vendor.fulfillment_rate) }}%
+                                </span>
+                            </td>
                             <td>{{ "%.1f"|format(vendor.avg_fulfillment_days) if vendor.avg_fulfillment_days else '-' }} days</td>
+                            <td style="color: {% if vendor.avg_days_late and vendor.avg_days_late > 0 %}var(--accent-red){% else %}var(--text-secondary){% endif %};">
+                                {{ "%.1f"|format(vendor.avg_days_late) if vendor.avg_days_late else '-' }} days
+                            </td>
                         </tr>
                         {% endfor %}
                     </tbody>
@@ -4025,6 +4489,56 @@ PO_DASHBOARD_TEMPLATE = '''
                 }
             });
         }
+        
+        // Date filter functions
+        function applyDateFilter() {
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+            
+            let url = window.location.pathname;
+            const params = new URLSearchParams();
+            
+            if (startDate) {
+                params.append('start_date', startDate);
+            }
+            if (endDate) {
+                params.append('end_date', endDate);
+            }
+            
+            if (params.toString()) {
+                url += '?' + params.toString();
+            }
+            
+            window.location.href = url;
+        }
+        
+        function clearDateFilter() {
+            document.getElementById('startDate').value = '';
+            document.getElementById('endDate').value = '';
+            window.location.href = window.location.pathname;
+        }
+        
+        // Allow Enter key to apply filter
+        document.addEventListener('DOMContentLoaded', function() {
+            const startDateInput = document.getElementById('startDate');
+            const endDateInput = document.getElementById('endDate');
+            
+            if (startDateInput) {
+                startDateInput.addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        applyDateFilter();
+                    }
+                });
+            }
+            
+            if (endDateInput) {
+                endDateInput.addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        applyDateFilter();
+                    }
+                });
+            }
+        });
     </script>
 </body>
 </html>
@@ -4033,9 +4547,15 @@ PO_DASHBOARD_TEMPLATE = '''
 @app.route('/po-management')
 def po_management():
     """Purchase Order Management Dashboard"""
+    from flask import request
+    
+    # Get date filter parameters
+    start_date = request.args.get('start_date', None)
+    end_date = request.args.get('end_date', None)
+    
     po_list = get_po_summary()
     po_aging = get_po_aging()
-    vendor_perf = get_vendor_performance()
+    vendor_perf = get_vendor_performance(start_date=start_date, end_date=end_date)
     overdue = get_overdue_pos()
     
     # Calculate KPIs
@@ -4084,7 +4604,8 @@ def po_management():
         po_list=formatted_pos,
         po_aging=po_aging,
         overdue_pos=overdue,
-        vendor_performance=vendor_perf
+        vendor_performance=vendor_perf,
+        request=request
     )
 
 # ================================================================================

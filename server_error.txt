@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "C:\Users\4510204\OneDrive - Metrohm Group\Documents\Cursor\Fishbowl Data\app.py", line 11, in <module>
+    from flask import Flask, render_template_string, jsonify, request, Response
+  File "C:\Users\4510204\AppData\Local\Programs\Python\Python312\Lib\site-packages\flask\__init__.py", line 5, in <module>
+    from . import json as json
+  File "C:\Users\4510204\AppData\Local\Programs\Python\Python312\Lib\site-packages\flask\json\__init__.py", line 7, in <module>
+    from .provider import _default
+  File "C:\Users\4510204\AppData\Local\Programs\Python\Python312\Lib\site-packages\flask\json\provider.py", line 4, in <module>
+    import decimal
+  File "C:\Users\4510204\AppData\Local\Programs\Python\Python312\Lib\decimal.py", line 102, in <module>
+    from _decimal import *
+  File "<frozen importlib._bootstrap>", line 1349, in _find_and_load
+KeyboardInterrupt
