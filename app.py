@@ -70,13 +70,16 @@ def get_current_shortages():
         (SELECT so.num FROM soitem si JOIN so ON si.soId = so.id WHERE si.id = pi.soItemId) as so_num,
         (SELECT so.customerId FROM soitem si JOIN so ON si.soId = so.id WHERE si.id = pi.soItemId) as so_customer_id,
         (SELECT c.name FROM soitem si JOIN so ON si.soId = so.id JOIN customer c ON so.customerId = c.id WHERE si.id = pi.soItemId) as so_customer_name,
-        -- Get related WO number  
+        -- Get related WO number (from pick's woItemId)
         (SELECT wo.num FROM woitem wi JOIN wo ON wi.woId = wo.id WHERE wi.id = pi.woItemId) as wo_num,
         -- Get related MO number (via WO -> moitem -> mo)
         (SELECT mo.num FROM woitem wi 
          JOIN moitem mi ON wi.moItemId = mi.id 
          JOIN mo ON mi.moId = mo.id 
          WHERE wi.id = pi.woItemId) as mo_num,
+        -- When pick has SO but no WO link, derive WO/MO from same SO and part (open MO)
+        (SELECT wo.num FROM soitem si JOIN so ON so.id = si.soId JOIN mo ON mo.soId = so.id AND mo.statusId IN (10,20,50) JOIN moitem mi ON mi.moId = mo.id AND mi.partId = p.id AND mi.typeId = 10 JOIN wo ON wo.moItemId = mi.id WHERE si.id = pi.soItemId AND pi.woItemId IS NULL LIMIT 1) as wo_num_derived,
+        (SELECT mo.num FROM soitem si JOIN so ON so.id = si.soId JOIN mo ON mo.soId = so.id AND mo.statusId IN (10,20,50) JOIN moitem mi ON mi.moId = mo.id AND mi.partId = p.id AND mi.typeId = 10 WHERE si.id = pi.soItemId AND pi.woItemId IS NULL LIMIT 1) as mo_num_derived,
         -- Get PO numbers for this part
         (SELECT GROUP_CONCAT(DISTINCT po.num ORDER BY poi.dateScheduledFulfillment SEPARATOR ', ')
          FROM poitem poi 
@@ -170,7 +173,7 @@ def categorize_shortages(shortages, filter_customer_id=None, exclude_mode=False)
     other_shortages = []
     
     for row in shortages:
-        pickitem_id, qty_short, part_id, part_num, desc, has_bom, pick_id, order_type, available_qoh, committed_qty, wip_qty, on_order, being_mfg_qty, so_num, so_customer_id, so_customer_name, wo_num, mo_num, po_nums, po_date_scheduled, has_open_mo, is_raw_material_in_mo, mo_with_rm_shortage = row
+        pickitem_id, qty_short, part_id, part_num, desc, has_bom, pick_id, order_type, available_qoh, committed_qty, wip_qty, on_order, being_mfg_qty, so_num, so_customer_id, so_customer_name, wo_num, mo_num, wo_num_derived, mo_num_derived, po_nums, po_date_scheduled, has_open_mo, is_raw_material_in_mo, mo_with_rm_shortage = row
         total_wip = float(wip_qty) + float(being_mfg_qty)
         net_available = float(available_qoh) - float(committed_qty)
         # A part is manufactured if it has a BOM (defaultBomId is not NULL and > 0)
@@ -178,14 +181,18 @@ def categorize_shortages(shortages, filter_customer_id=None, exclude_mode=False)
         has_open_mo_count = int(has_open_mo or 0)
         is_raw_material_in_mo_count = int(is_raw_material_in_mo or 0)
         mo_with_rm_shortage_count = int(mo_with_rm_shortage or 0)
+        # Use derived WO/MO when pick has SO but no direct woItemId link
+        wo_display = wo_num or wo_num_derived
+        mo_display = mo_num or mo_num_derived
         
-        # Build order reference string (excluding MO numbers)
+        # Build order reference: show SO, WO, and MO when available (so WIP shows WO/MO, not only SO)
         orders = []
         if so_num:
             orders.append(f"SO:{so_num}")
-        if wo_num:
-            orders.append(f"WO:{wo_num}")
-        # MO numbers removed per user request
+        if wo_display:
+            orders.append(f"WO:{wo_display}")
+        if mo_display:
+            orders.append(f"MO:{mo_display}")
         order_ref = ", ".join(orders) if orders else order_type
         
         # Format PO scheduled date
@@ -1906,6 +1913,7 @@ HTML_TEMPLATE = '''
                                 <th>Part Number</th>
                                 <th>Description</th>
                                 <th># Orders</th>
+                                <th>Qty Short</th>
                                 <th>Order Numbers</th>
                                 <th>WIP</th>
                                 <th>Being Mfg</th>
@@ -1917,6 +1925,7 @@ HTML_TEMPLATE = '''
                                 <td class="part-num">{{ part.part_num }}</td>
                                 <td>{{ part.description[:22] }}</td>
                                 <td><span class="badge orange">{{ part.order_count }}</span></td>
+                                <td><span class="badge orange">{{ part.total_qty_short|int }}</span></td>
                                 <td>
                                     <span class="order-ref">
                                         {% if part.orders_visible %}
@@ -2565,9 +2574,11 @@ def dashboard():
                 'wip': s['wip_qty'],
                 'being_mfg': s['being_mfg_qty'],
                 'order_refs': set(),
-                'count': 0
+                'count': 0,
+                'total_qty_short': 0
             }
         wip_by_part[s['part_num']]['count'] += 1
+        wip_by_part[s['part_num']]['total_qty_short'] += s['qty_short']
         if s['order_ref']:
             wip_by_part[s['part_num']]['order_refs'].add(s['order_ref'])
     
